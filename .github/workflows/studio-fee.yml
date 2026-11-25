@@ -1,0 +1,101 @@
+name: Ironwood Studio intake fee
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: Studio approval ID
+        type: string
+        required: true
+      payload:
+        description: Signed approval payload
+        type: string
+        required: true
+      signature:
+        description: Approval signature
+        type: string
+        required: true
+
+concurrency:
+  group: studio-fee-${{ inputs.id }}
+  cancel-in-progress: false
+
+permissions: {}
+env:
+  STUDIO_ID: ${{ inputs.id }}
+  STUDIO_PAYLOAD: ${{ inputs.payload }}
+  STUDIO_SIGNATURE: ${{ inputs.signature }}
+  STUDIO_PUBLIC_KEY: ${{ vars.STUDIO_PUBLIC_KEY }}
+
+jobs:
+  propose:
+    if: github.repository == 'xironwood/ironwood-studio-pilot' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      candidate: ${{ steps.proposal.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Prepare the approved fee change
+        id: proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD)"
+          node approval.mjs prepare "$base"
+          branch="studio/$STUDIO_ID"
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            candidate="$(git rev-parse "refs/remotes/origin/$branch")"
+          else
+            git add -- fees.json
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
+              -m 'Apply the approved pilot intake fee' -m "Studio-Approval: $STUDIO_ID"
+            candidate="$(git rev-parse HEAD)"
+          fi
+          node approval.mjs verify "$base" "$candidate"
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git push origin "$candidate:refs/heads/$branch"
+          fi
+          pr="$(gh pr list --state open --head "$branch" --base main --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            gh pr create --head "$branch" --base main --title 'Approve the pilot intake fee' \
+              --body "Studio receipt $STUDIO_ID. Review the fee change and wait for verify-approval. Cloudflare Pages publishes after merge."
+          fi
+          printf 'candidate=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+  verify:
+    needs: propose
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Verify the exact commit from trusted main
+        id: approved
+        env:
+          CANDIDATE: ${{ needs.propose.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          base="$(git rev-parse FETCH_HEAD)"
+          node approval.mjs verify "$base" "$CANDIDATE"
+      - name: Record the status on the reviewed commit
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.propose.outputs.candidate }}
+          OUTCOME: ${{ steps.approved.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]
+          state=failure
+          if [[ "$OUTCOME" == success ]]; then state=success; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$CANDIDATE" \
+            -f context=verify-approval -f state="$state" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --silent
